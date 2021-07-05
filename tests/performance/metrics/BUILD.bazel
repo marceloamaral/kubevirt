@@ -1,0 +1,9 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["metrics.go"],
+    importpath = "kubevirt.io/kubevirt/tests/performance/metrics",
+    visibility = ["//visibility:public"],
+    deps = ["//staging/src/kubevirt.io/client-go/api/v1:go_default_library"],
+)

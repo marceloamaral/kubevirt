@@ -1,0 +1,22 @@
+# [Slow] are the tests that takes more than 5mim, and should only be carefully select to run in specific scenarios
+density_tests:
+  - ginko_label: "[Slow][small-scale]"
+    num_vms: 20
+    num_bg_vms: 20
+    arrival_rate: 0.002
+    arrival_unit: 1ms
+    arrival_rate_func_name: poisson
+    vm_image_name: cirros
+    cpu_limit: 100m
+    mem_limit: 90Mi
+    # max acceptable latency in seconds
+    vm_startup_limits:
+      perc50: 350
+      perc90: 400
+      perc99: 450
+    vm_batch_startup_limit: 700
+    vm_deletion_limit: 250
+    vm_batch_deletion_limit: 700
+    wait_vm_boot: false
+    wait_vm_reply_ping: false
+    cloud_init_user_data: "#!/bin/bash\necho 'hello'\n"
