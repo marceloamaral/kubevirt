@@ -30,13 +30,6 @@ type MetricType int
 
 type Unit string
 
-// These are the valid statuses of pods.
-const (
-	Seconds    = "seconds"
-	MegaBytes  = "MB"
-	Percentage = "percentage"
-)
-
 // Metric is a struct for metrics for performance tests, it can be latencies or resource usage.
 type Metric struct {
 	Perc50 float64 `yaml:"perc50"`
