@@ -36,6 +36,10 @@ if [[ ${KUBEVIRT_PROVIDER} == os-* ]] || [[ ${KUBEVIRT_PROVIDER} =~ (okd|ocp)-* 
     oc=${kubectl}
 fi
 
+if [ -z "$kubeconfig" ]; then
+  kubeconfig="$KUBECONFIG"
+fi
+
 echo 'Performance testing'
 export KUBEVIRT_E2E_PERF_TEST=true
 

@@ -22,6 +22,7 @@ package performance
 import (
 	"flag"
 	"os"
+	"strconv"
 
 	. "github.com/onsi/ginkgo"
 )
@@ -30,8 +31,7 @@ var RunPerfTests = false
 
 func init() {
 	flag.BoolVar(&RunPerfTests, "performance-test", false, "run performance tests. If false, all performance tests will be skiped.")
-	ptest := os.Getenv("KUBEVIRT_E2E_PERF_TEST")
-	if ptest == "true" || ptest == "True" {
+	if ptest, _ := strconv.ParseBool(os.Getenv("KUBEVIRT_E2E_PERF_TEST")); ptest {
 		RunPerfTests = true
 	}
 }

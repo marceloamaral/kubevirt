@@ -21,20 +21,20 @@ package performance
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
 	k8sv1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 
 	kvv1 "kubevirt.io/client-go/api/v1"
 	cd "kubevirt.io/kubevirt/tests/containerdisk"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"kubevirt.io/client-go/kubecli"
 	"kubevirt.io/kubevirt/tests"
@@ -44,31 +44,16 @@ import (
 )
 
 type DensityTest struct {
-	NumVMs               int               `yaml:"num_vms"`                 // number of vms
-	ArrivalRate          float64           `yaml:"arrival_rate"`            // number fo vms per second
-	ArrivalUnit          time.Duration     `yaml:"arrival_unit"`            // to convert from second to another unit
-	ArrivalRateFuncName  string            `yaml:"arrival_rate_func_name"`  // e.g. using a constant interval or a poisson process
+	VMCount              int               `yaml:"vm_count"`                // total number of vms
 	VMImage              cd.ContainerDisk  `yaml:"vm_image_name"`           // the image type will reflect in the storage size
 	CPULimit             string            `yaml:"cpu_limit"`               // number of CPUs to allocate (100m = .1 cores)
-	MEMLimit             string            `yaml:"mem_limit"`               // amount of Memory to allocate
+	MemLimit             string            `yaml:"mem_limit"`               // amount of Memory to allocate
 	VMStartupLimits      e2emetrics.Metric `yaml:"vm_startup_limits"`       // percentile limit of single vm startup latency
 	VMBatchStartupLimit  time.Duration     `yaml:"vm_batch_startup_limit"`  // upbound of startup latency of a batch of vms
 	VMDeletionLimit      time.Duration     `yaml:"vm_deletion_limit"`       // time limit of single vm deletion in seconds
 	VMBatchDeletionLimit time.Duration     `yaml:"vm_batch_deletion_limit"` // time limit of a batch of vms deletion
 	CloudInitUserData    string            `yaml:"cloud_init_user_data"`    // script to run into the VM during the startup
 	GinkoLabel           string            `yaml:"ginko_label"`             // test label [small-scale] [medium-scale] [large-scale]
-}
-
-// ArrivalRateFunc generate arrival time. The default is a stepped load with an interval of 300 miliseconds
-func (t *DensityTest) ArrivalRateFunc(arrivalRate float64) time.Duration {
-	if strings.Contains(string(t.ArrivalRateFuncName), "poisson") {
-		return poissonProcess(arrivalRate)
-	}
-	// ArrivalRate is the number fo vms per second. Then, we calculate a stepped interval between VMs
-	if t.ArrivalRate > 0 {
-		return time.Duration(1/t.ArrivalRate) * time.Millisecond
-	}
-	return time.Duration(300) * time.Millisecond
 }
 
 var _ = SIGDescribe("Control Plane Performance Density Testing", func() {
@@ -85,21 +70,20 @@ var _ = SIGDescribe("Control Plane Performance Density Testing", func() {
 
 	densityTests := []DensityTest{
 		{
-			NumVMs:              100,
-			ArrivalRate:         0.002, // Vms per second
-			ArrivalUnit:         time.Millisecond,
-			ArrivalRateFuncName: "poisson",
-			VMImage:             "cirros",
-			CPULimit:            "100m",
-			MEMLimit:            "90Mi",
+			VMCount:  100,
+			VMImage:  "cirros",
+			CPULimit: "100m",
+			MemLimit: "90Mi",
 			VMStartupLimits: e2emetrics.Metric{
-				Perc50: 36,
-				Perc90: 38,
-				Perc99: 43,
+				Perc: map[int]float64{
+					50: 60.0,
+					90: 70.0,
+					99: 80.0,
+				},
 			},
-			VMBatchStartupLimit:  120,
-			VMDeletionLimit:      72,
-			VMBatchDeletionLimit: 120,
+			VMBatchStartupLimit:  300,
+			VMDeletionLimit:      80,
+			VMBatchDeletionLimit: 300,
 			CloudInitUserData:    "#!/bin/bash\necho 'hello'\n",
 			GinkoLabel:           "[small]",
 		},
@@ -109,16 +93,40 @@ var _ = SIGDescribe("Control Plane Performance Density Testing", func() {
 	Describe("Density test", func() {
 
 		for _, testArg := range densityTests {
-			Context(fmt.Sprintf("%s create a batch of %d VMIs", testArg.GinkoLabel, testArg.NumVMs), func() {
+			Context(fmt.Sprintf("%s create a batch of %d VMIs", testArg.GinkoLabel, testArg.VMCount), func() {
 
-				desc := fmt.Sprintf("latency should be within limit of %d seconds when create %d vms with rate of %v/second",
-					int(testArg.VMBatchStartupLimit), testArg.NumVMs, testArg.ArrivalRate)
+				desc := fmt.Sprintf("latency should be within limit of %d seconds when create %d vms",
+					int(testArg.VMBatchStartupLimit), testArg.VMCount)
+
 				It(desc, func() {
-					batchStartupLag, batchTerminationLag, e2eData := runDensityBatchTest(virtClient, testArg)
+					status := e2emetrics.NewBatchStatus()
+
+					By("Starting vmi watcher")
+					quit := make(chan bool)
+					go watchVMI(virtClient, status, testArg, quit)
+
+					By("Creating a batch of VMIs")
+					fmt.Printf("\nCreating a batch of %d VMIs\n", testArg.VMCount)
+					start := time.Now()
+					createBatchVMWithRateControl(virtClient, testArg)
+					By("Waiting a batch of VMIs")
+					waitVMIBatchStatus(status, kvv1.Running, testArg.VMCount, testArg.VMBatchStartupLimit*time.Second)
+					end := time.Now()
+					batchStartupLag := end.Sub(start) / time.Second
+
+					By("Deleting all VMIs")
+					fmt.Println("Deleting all VMIs")
+					start = time.Now()
+					deleteVMIBatch(virtClient, status, testArg)
+					waitVMIBatchStatus(status, kvv1.Succeeded, testArg.VMCount, testArg.VMBatchDeletionLimit*time.Second)
+					end = time.Now()
+					batchTerminationLag := end.Sub(start) / time.Second
+
+					By("Stop vmi watcher")
+					close(quit)
 
 					By("Verifying latency")
-					logAndVerifyVMCreationMetrics(batchStartupLag, batchTerminationLag, e2eData, testArg, true)
-
+					logAndVerifyVMCreationMetrics(batchStartupLag, batchTerminationLag, status.GetVMIMetrics(), testArg, true)
 				})
 			})
 		}
@@ -126,163 +134,124 @@ var _ = SIGDescribe("Control Plane Performance Density Testing", func() {
 
 })
 
-// runDensityBatchTest runs the density batch vm creation test
-func runDensityBatchTest(virtClient kubecli.KubevirtClient, testArg DensityTest) (time.Duration, time.Duration, map[kvv1.VirtualMachineInstancePhase]e2emetrics.Slice) {
-	var (
-		queue   = make(chan map[kvv1.VirtualMachineInstancePhase]e2emetrics.VMMetricData)
-		e2eData = make(map[kvv1.VirtualMachineInstancePhase]e2emetrics.Slice)
-	)
-
-	By("Creating a batch of vms")
-	firstCreate := time.Now()
-	vmList := createBatchVMWithRateControl(virtClient, testArg, queue)
-	By("Waiting for all VMIs become ready...")
-	waitResults(queue, &e2eData, testArg, kvv1.Running, testArg.VMBatchStartupLimit)
-
-	lastRunning := time.Now()
-	batchStartupLag := lastRunning.Sub(firstCreate) / time.Second
-	fmt.Printf("total batch VMI startup latency %f seconds\n", float64(batchStartupLag))
-
-	By("Deleting all VirtualMachineInstance")
-	firstDelete := time.Now()
-	queue = make(chan map[kvv1.VirtualMachineInstancePhase]e2emetrics.VMMetricData)
-	for _, vmi := range vmList {
-		go watchVMIDeletion(virtClient, queue, vmi, testArg.VMDeletionLimit*time.Second)
-	}
-	By("Wait all VirtualMachineInstance Disappear")
-	waitResults(queue, &e2eData, testArg, kvv1.Succeeded, testArg.VMDeletionLimit)
-
-	lastRunning = time.Now()
-	batchTerminationLag := lastRunning.Sub(firstDelete) / time.Second
-	fmt.Printf("total batch VMI deletetion latency %d", batchStartupLag)
-
-	return batchStartupLag, batchTerminationLag, e2eData
-}
-
-func waitResults(queue chan map[kvv1.VirtualMachineInstancePhase]e2emetrics.VMMetricData, e2eData *map[kvv1.VirtualMachineInstancePhase]e2emetrics.Slice,
-	testArg DensityTest, stopType kvv1.VirtualMachineInstancePhase, timout time.Duration) {
-	timeoutq := time.After(timout * time.Second)
-	var err error
-startupChannel:
-	for {
-		select {
-		case <-timeoutq: // timed out
-			err = fmt.Errorf("failed for %s of %v VMIs from %v within the expected interval %v",
-				stopType,
-				testArg.NumVMs-len((*e2eData)[stopType]),
-				testArg.NumVMs, testArg.VMBatchStartupLimit*time.Second)
-			break startupChannel
-
-		case e2eD := <-queue:
-			for metric, val := range e2eD {
-				(*e2eData)[metric] = append((*e2eData)[metric], val)
-			}
-
-			if len((*e2eData)[stopType]) == testArg.NumVMs {
-				err = nil
-				break startupChannel
-			}
-		}
-	}
-	Expect(err).ToNot(HaveOccurred())
-}
-
 // createBatchVMWithRateControl creates a batch of vms concurrently, uses one goroutine for each creation.
 // between creations there is an interval for throughput control
-func createBatchVMWithRateControl(virtClient kubecli.KubevirtClient, testArg DensityTest,
-	queue chan map[kvv1.VirtualMachineInstancePhase]e2emetrics.VMMetricData) map[string]*kvv1.VirtualMachineInstance {
+func createBatchVMWithRateControl(virtClient kubecli.KubevirtClient, testArg DensityTest) {
 	defer GinkgoRecover()
-	vmList := make(map[string]*kvv1.VirtualMachineInstance)
 
-	for i := 1; i <= testArg.NumVMs; i++ {
+	for i := 1; i <= testArg.VMCount; i++ {
 		vmi := createVMISpecWithResources(virtClient, testArg)
-		vmList[vmi.ObjectMeta.Name] = vmi
-
-		// watch VMIs in parallel until they are ready
-		// golang allows hundreds of thousands goroutines in the same address space with very low overhead
-		go watchVMIPhases(virtClient, testArg, queue, vmi)
+		By(fmt.Sprintf("Creating VMI %s", vmi.ObjectMeta.Name))
+		_, err := virtClient.VirtualMachineInstance(util.NamespaceTestDefault).Create(vmi)
+		Expect(err).ToNot(HaveOccurred())
 
 		// control the throughput with waiting interval
-		interval := testArg.ArrivalRateFunc(testArg.ArrivalRate)
-		time.Sleep(interval * testArg.ArrivalUnit)
+		time.Sleep(300 * time.Millisecond)
 	}
-
-	return vmList
 }
 
 func createVMISpecWithResources(virtClient kubecli.KubevirtClient, testArg DensityTest) *kvv1.VirtualMachineInstance {
 	vmi := tests.NewRandomVMIWithEphemeralDiskAndUserdata(cd.ContainerDiskFor(testArg.VMImage), testArg.CloudInitUserData)
 	vmi.Spec.Domain.Resources.Limits = k8sv1.ResourceList{
-		k8sv1.ResourceMemory: resource.MustParse(testArg.MEMLimit),
+		k8sv1.ResourceMemory: resource.MustParse(testArg.MemLimit),
 		k8sv1.ResourceCPU:    resource.MustParse(testArg.CPULimit),
 	}
 	vmi.Spec.Domain.Resources.Requests = k8sv1.ResourceList{
-		k8sv1.ResourceMemory: resource.MustParse(testArg.MEMLimit),
+		k8sv1.ResourceMemory: resource.MustParse(testArg.MemLimit),
 		k8sv1.ResourceCPU:    resource.MustParse(testArg.CPULimit),
 	}
 	return vmi
 }
 
-func watchVMIPhases(virtClient kubecli.KubevirtClient, testArg DensityTest, queue chan map[kvv1.VirtualMachineInstancePhase]e2emetrics.VMMetricData,
-	vmi *kvv1.VirtualMachineInstance) {
+func watchVMI(virtClient kubecli.KubevirtClient, status *e2emetrics.BatchStatus, testArg DensityTest, quit chan bool) {
 	defer GinkgoRecover()
 
-	e2eData := make(map[kvv1.VirtualMachineInstancePhase]e2emetrics.VMMetricData)
-
-	By(fmt.Sprintf("Creating VMI %s and wait it to start running", vmi.ObjectMeta.Name))
-	_, err := virtClient.VirtualMachineInstance(util.NamespaceTestDefault).Create(vmi)
+	watcher, err := virtClient.VirtualMachineInstance(util.NamespaceTestDefault).Watch(metav1.ListOptions{})
 	Expect(err).ToNot(HaveOccurred())
 
-	tests.WaitForSuccessfulVMIStartWithTimeoutIgnoreWarnings(vmi, int(testArg.VMStartupLimits.Perc99))
+	// wait the VMI deletion status
+	timeout := time.After(testArg.VMBatchDeletionLimit * time.Second)
 
-	vmi, err = virtClient.VirtualMachineInstance(vmi.Namespace).Get(vmi.Name, &metav1.GetOptions{})
-	Expect(err).To(BeNil())
+	for {
+		select {
+		case <-quit:
+			return
+		case <-timeout:
+			err = fmt.Errorf("failed to create %v VMIs within the expected interval %v",
+				testArg.VMCount, testArg.VMBatchDeletionLimit*time.Second)
+			Expect(err).ToNot(HaveOccurred())
 
-	creationTs := vmi.ObjectMeta.CreationTimestamp
-	for _, phaseTrans := range vmi.Status.PhaseTransitionTimestamps {
-		timestamp := phaseTrans.PhaseTransitionTimestamp
-		latencyData := e2emetrics.VMMetricData{
-			Name:  vmi.ObjectMeta.Name,
-			Value: float64(timestamp.Time.Sub(creationTs.Time).Nanoseconds()) / float64(time.Second),
-			Unit:  "second",
+		case event := <-watcher.ResultChan():
+			handleVMIEvent(event, status, virtClient, testArg)
 		}
-		e2eData[phaseTrans.Phase] = latencyData
 	}
-
-	queue <- e2eData
 }
 
-// watchVMIDeletion measure the deletion time without watching events due to scalability reasons
-func watchVMIDeletion(virtClient kubecli.KubevirtClient, queue chan map[kvv1.VirtualMachineInstancePhase]e2emetrics.VMMetricData,
-	vmi *kvv1.VirtualMachineInstance, timeout time.Duration) {
+func handleVMIEvent(event watch.Event, status *e2emetrics.BatchStatus, virtClient kubecli.KubevirtClient, testArg DensityTest) error {
 	defer GinkgoRecover()
 
-	// for high accuracy, we watch the phases with a small polling interval
+	vmi, ok := event.Object.(*kvv1.VirtualMachineInstance)
+	Expect(ok).To(BeTrue())
+
+	switch event.Type {
+
+	case watch.Modified:
+		if vmi.Status.Phase == kvv1.Running {
+			status.AddVMIPhaseMetrics(*vmi)
+		}
+
+	case watch.Deleted:
+		go waitVMIDisapear(virtClient, vmi, status, testArg.VMDeletionLimit*time.Second)
+	}
+
+	return nil
+}
+
+// waitVMIDisapear measure the deletion time without watching events due to scalability reasons
+func waitVMIDisapear(virtClient kubecli.KubevirtClient, vmi *kvv1.VirtualMachineInstance, status *e2emetrics.BatchStatus, timeout time.Duration) {
+	defer GinkgoRecover()
+
+	// for high accuracy, we watch the phases with a very small pooling interval
 	pollingInterval := 300 * time.Millisecond
-	e2eData := make(map[kvv1.VirtualMachineInstancePhase]e2emetrics.VMMetricData)
 
-	By(fmt.Sprintf("Deleting VMI %s", vmi.ObjectMeta.Name))
-	terminatingTime := time.Now()
-	err := virtClient.VirtualMachineInstance(vmi.Namespace).Delete(vmi.Name, &metav1.DeleteOptions{})
-	Expect(err).To(BeNil())
-
+	By(fmt.Sprintf("Waiting VMI %s disapear", vmi.ObjectMeta.Name))
 	Eventually(func() error {
-		_, err := virtClient.VirtualMachineInstance(vmi.Namespace).Get(vmi.Name, &metav1.GetOptions{})
+		_, err := virtClient.VirtualMachineInstance(vmi.Namespace).Get(vmi.ObjectMeta.Name, &metav1.GetOptions{})
 		return err
 	}, timeout, pollingInterval).Should(
 		SatisfyAll(HaveOccurred(), WithTransform(errors.IsNotFound, BeTrue())),
 		"The VMI should be gone within the given timeout",
 	)
 
-	deleteTime := time.Now()
-	latencyData := e2emetrics.VMMetricData{
-		Name:  vmi.ObjectMeta.Name,
-		Value: float64(deleteTime.Sub(terminatingTime).Nanoseconds()) / float64(time.Second),
-		Unit:  "second",
-	}
-	e2eData[kvv1.Succeeded] = latencyData
+	status.AddVMIDeletionMetrics(*vmi)
+}
 
-	queue <- e2eData
+func deleteVMIBatch(virtClient kubecli.KubevirtClient, status *e2emetrics.BatchStatus, testArg DensityTest) {
+	status.RLock()
+	for _, data := range status.GetVMIPhaseMap(kvv1.Running) {
+		// the GracePeriod is set to force the server to set the DeletionTimestamp
+		gracePeriodSeconds := int64(0)
+		err := virtClient.VirtualMachineInstance(data.Namespace).Delete(data.Name, &metav1.DeleteOptions{GracePeriodSeconds: &gracePeriodSeconds})
+		Expect(err).To(BeNil())
+		time.Sleep(200 * time.Millisecond)
+	}
+	status.RUnlock()
+}
+
+func waitVMIBatchStatus(status *e2emetrics.BatchStatus, phase kvv1.VirtualMachineInstancePhase, vmiCount int, timeout time.Duration) error {
+	for timeout := time.After(timeout); ; {
+		select {
+		case <-timeout:
+			return fmt.Errorf("failed to create %v VMIs within the expected interval %v", vmiCount, timeout)
+
+		default:
+			if status.PhaseSize(phase) >= vmiCount {
+				return nil
+			}
+			time.Sleep(5 * time.Second)
+			fmt.Println(status.PhaseSize(phase), phase, " VMs")
+		}
+	}
 }
 
 // logAndVerifyVMCreationMetrics verifies that whether vm creation latency satisfies the limit.
@@ -295,19 +264,21 @@ func logAndVerifyVMCreationMetrics(batchStartupLag time.Duration, batchTerminati
 
 		// check whether e2e vm startup time is acceptable.
 		By("Verify latency within threshold")
-		Expect(VerifyMetricWithinThreshold(testArg.VMStartupLimits, vmLatencies[kvv1.Running], "vm startup")).ToNot(HaveOccurred())
+		Expect(e2emetrics.VerifyMetricWithinThreshold(testArg.VMStartupLimits, vmLatencies[kvv1.Running], "vm startup")).ToNot(HaveOccurred())
 
 		// check bactch vm creation latency
 		if testArg.VMBatchStartupLimit > 0 {
 			By("VM Batch Startup Limit")
 			Expect(batchStartupLag <= testArg.VMBatchStartupLimit*time.Second).To(Equal(true))
 		}
+		fmt.Printf("VM Batch Startup Time %v", batchStartupLag)
 
 		// check bactch vm creation latency
 		if testArg.VMBatchDeletionLimit > 0 {
-			By("VM Batch Termination Limit")
+			By("VM Batch Deletion Limit")
 			Expect(batchTerminationLag <= testArg.VMBatchDeletionLimit*time.Second).To(Equal(true))
 		}
+		fmt.Printf("VM Batch Deletion Time %v", batchTerminationLag)
 	}
 
 	// Print aggregated data for Running phase
@@ -316,7 +287,7 @@ func logAndVerifyVMCreationMetrics(batchStartupLag time.Duration, batchTerminati
 		if phase == kvv1.Succeeded {
 			interval = "Running to Deleted"
 		}
-		PrintMetrics(e2eData[phase].Sort(),
+		e2emetrics.PrintMetrics(e2eData[phase].Sort(),
 			fmt.Sprintf("worst client e2e latencies from %s", interval))
 	}
 
