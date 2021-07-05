@@ -41,12 +41,10 @@ import (
 	"kubevirt.io/kubevirt/tests/util"
 
 	e2emetrics "kubevirt.io/kubevirt/tests/performance/metrics"
-	"kubevirt.io/kubevirt/tests/performance/perftype"
 )
 
 type DensityTest struct {
 	NumVMs               int               `yaml:"num_vms"`                 // number of vms
-	NumBGVMs             int               `yaml:"num_bg_vms"`              // number of background vms
 	ArrivalRate          float64           `yaml:"arrival_rate"`            // number fo vms per second
 	ArrivalUnit          time.Duration     `yaml:"arrival_unit"`            // to convert from second to another unit
 	ArrivalRateFuncName  string            `yaml:"arrival_rate_func_name"`  // e.g. using a constant interval or a poisson process
@@ -87,8 +85,7 @@ var _ = SIGDescribe("Control Plane Performance Density Testing", func() {
 
 	densityTests := []DensityTest{
 		{
-			NumVMs:              5,
-			NumBGVMs:            20,
+			NumVMs:              100,
 			ArrivalRate:         0.002, // Vms per second
 			ArrivalUnit:         time.Millisecond,
 			ArrivalRateFuncName: "poisson",
@@ -96,13 +93,13 @@ var _ = SIGDescribe("Control Plane Performance Density Testing", func() {
 			CPULimit:            "100m",
 			MEMLimit:            "90Mi",
 			VMStartupLimits: e2emetrics.Metric{
-				Perc50: 350,
-				Perc90: 400,
-				Perc99: 450,
+				Perc50: 36,
+				Perc90: 38,
+				Perc99: 43,
 			},
-			VMBatchStartupLimit:  400,
-			VMDeletionLimit:      250,
-			VMBatchDeletionLimit: 400,
+			VMBatchStartupLimit:  120,
+			VMDeletionLimit:      72,
+			VMBatchDeletionLimit: 120,
 			CloudInitUserData:    "#!/bin/bash\necho 'hello'\n",
 			GinkoLabel:           "[small]",
 		},
@@ -114,7 +111,8 @@ var _ = SIGDescribe("Control Plane Performance Density Testing", func() {
 		for _, testArg := range densityTests {
 			Context(fmt.Sprintf("%s create a batch of %d VMIs", testArg.GinkoLabel, testArg.NumVMs), func() {
 
-				desc := fmt.Sprintf("latency should be within limit when create %d vms with rate of %v/second", testArg.NumVMs, testArg.ArrivalRate)
+				desc := fmt.Sprintf("latency should be within limit of %d seconds when create %d vms with rate of %v/second",
+					int(testArg.VMBatchStartupLimit), testArg.NumVMs, testArg.ArrivalRate)
 				It(desc, func() {
 					batchStartupLag, batchTerminationLag, e2eData := runDensityBatchTest(virtClient, testArg)
 
@@ -143,7 +141,7 @@ func runDensityBatchTest(virtClient kubecli.KubevirtClient, testArg DensityTest)
 
 	lastRunning := time.Now()
 	batchStartupLag := lastRunning.Sub(firstCreate) / time.Second
-	fmt.Printf("total batch VMI startup latency %d", batchStartupLag)
+	fmt.Printf("total batch VMI startup latency %f seconds\n", float64(batchStartupLag))
 
 	By("Deleting all VirtualMachineInstance")
 	firstDelete := time.Now()
@@ -236,23 +234,19 @@ func watchVMIPhases(virtClient kubecli.KubevirtClient, testArg DensityTest, queu
 	Expect(err).ToNot(HaveOccurred())
 
 	tests.WaitForSuccessfulVMIStartWithTimeoutIgnoreWarnings(vmi, int(testArg.VMStartupLimits.Perc99))
-	By(fmt.Sprintf("VMI %s is running %v", vmi.ObjectMeta.Name, vmi.Status.PhaseTransitionTimestamps))
 
-	var createts metav1.Time
+	vmi, err = virtClient.VirtualMachineInstance(vmi.Namespace).Get(vmi.Name, &metav1.GetOptions{})
+	Expect(err).To(BeNil())
+
+	creationTs := vmi.ObjectMeta.CreationTimestamp
 	for _, phaseTrans := range vmi.Status.PhaseTransitionTimestamps {
-		if phaseTrans.Phase == kvv1.VmPhaseUnset {
-			// creation timestamp is when a VirtualMachineInstance Object is first initialized
-			createts = phaseTrans.PhaseTransitionTimestamp
-			continue
-		}
 		timestamp := phaseTrans.PhaseTransitionTimestamp
 		latencyData := e2emetrics.VMMetricData{
 			Name:  vmi.ObjectMeta.Name,
-			Value: float64(timestamp.Time.Sub(createts.Time)) / float64(time.Second),
-			Unit:  e2emetrics.Seconds,
+			Value: float64(timestamp.Time.Sub(creationTs.Time).Nanoseconds()) / float64(time.Second),
+			Unit:  "second",
 		}
 		e2eData[phaseTrans.Phase] = latencyData
-		By(fmt.Sprintf("VMI %s phase %s, %f seconds ", vmi.ObjectMeta.Name, phaseTrans.Phase, latencyData.Value))
 	}
 
 	queue <- e2eData
@@ -283,11 +277,10 @@ func watchVMIDeletion(virtClient kubecli.KubevirtClient, queue chan map[kvv1.Vir
 	deleteTime := time.Now()
 	latencyData := e2emetrics.VMMetricData{
 		Name:  vmi.ObjectMeta.Name,
-		Value: float64(deleteTime.Sub(terminatingTime)) / float64(time.Second),
-		Unit:  e2emetrics.Seconds,
+		Value: float64(deleteTime.Sub(terminatingTime).Nanoseconds()) / float64(time.Second),
+		Unit:  "second",
 	}
 	e2eData[kvv1.Succeeded] = latencyData
-	By(fmt.Sprintf("VMI %s terminated in %.4f s", vmi.ObjectMeta.Name, float64(time.Duration(latencyData.Value)/time.Second)))
 
 	queue <- e2eData
 }
@@ -295,13 +288,11 @@ func watchVMIDeletion(virtClient kubecli.KubevirtClient, queue chan map[kvv1.Vir
 // logAndVerifyVMCreationMetrics verifies that whether vm creation latency satisfies the limit.
 func logAndVerifyVMCreationMetrics(batchStartupLag time.Duration, batchTerminationLag time.Duration, e2eData map[kvv1.VirtualMachineInstancePhase]e2emetrics.Slice,
 	testArg DensityTest, isVerify bool) {
-	vmLatencies := make(map[kvv1.VirtualMachineInstancePhase]e2emetrics.Metric)
-
-	for phase := range e2eData {
-		vmLatencies[phase] = e2emetrics.ExtractMetrics(e2eData[phase].Sort())
-	}
 
 	if isVerify {
+		vmLatencies := make(map[kvv1.VirtualMachineInstancePhase]e2emetrics.Metric)
+		vmLatencies[kvv1.Running] = e2emetrics.ExtractMetrics(e2eData[kvv1.Running].Sort())
+
 		// check whether e2e vm startup time is acceptable.
 		By("Verify latency within threshold")
 		Expect(VerifyMetricWithinThreshold(testArg.VMStartupLimits, vmLatencies[kvv1.Running], "vm startup")).ToNot(HaveOccurred())
@@ -320,9 +311,13 @@ func logAndVerifyVMCreationMetrics(batchStartupLag time.Duration, batchTerminati
 	}
 
 	// Print aggregated data for Running phase
-	PrintMetrics(e2eData[kvv1.Running].Sort(), "worst client e2e total latencies")
+	for phase := range e2eData {
+		interval := fmt.Sprintf("Creation to %s", string(phase))
+		if phase == kvv1.Succeeded {
+			interval = "Running to Deleted"
+		}
+		PrintMetrics(e2eData[phase].Sort(),
+			fmt.Sprintf("worst client e2e latencies from %s", interval))
+	}
 
-	// log latency perf data
-	perfData := perftype.GetPerfData(vmLatencies, "density-test")
-	LogPerfData(perfData, "vmi")
 }
