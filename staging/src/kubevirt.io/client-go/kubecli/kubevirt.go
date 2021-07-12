@@ -27,6 +27,7 @@ package kubecli
 
 import (
 	"io"
+	"net"
 
 	secv1 "github.com/openshift/client-go/security/clientset/versioned/typed/security/v1"
 	autov1 "k8s.io/api/autoscaling/v1"
@@ -60,6 +61,7 @@ type KubevirtClient interface {
 	VirtualMachineSnapshotContent(namespace string) vmsnapshotv1alpha1.VirtualMachineSnapshotContentInterface
 	VirtualMachineRestore(namespace string) vmsnapshotv1alpha1.VirtualMachineRestoreInterface
 	ServerVersion() *ServerVersion
+	GuestfsVersion() *GuestfsVersion
 	RestClient() *rest.RESTClient
 	GeneratedKubeVirtClient() generatedclient.Interface
 	CdiClient() cdiclient.Interface
@@ -154,6 +156,7 @@ type StreamOptions struct {
 
 type StreamInterface interface {
 	Stream(options StreamOptions) error
+	AsConn() net.Conn
 }
 
 type VirtualMachineInstanceInterface interface {
@@ -166,6 +169,7 @@ type VirtualMachineInstanceInterface interface {
 	Watch(opts metav1.ListOptions) (watch.Interface, error)
 	SerialConsole(name string, options *SerialConsoleOptions) (StreamInterface, error)
 	VNC(name string) (StreamInterface, error)
+	PortForward(name string, port int, protocol string) (StreamInterface, error)
 	Pause(name string) error
 	Unpause(name string) error
 	GuestOsInfo(name string) (v1.VirtualMachineInstanceGuestAgentInfo, error)
@@ -216,6 +220,7 @@ type VirtualMachineInterface interface {
 	Migrate(name string) error
 	AddVolume(name string, addVolumeOptions *v1.AddVolumeOptions) error
 	RemoveVolume(name string, removeVolumeOptions *v1.RemoveVolumeOptions) error
+	PortForward(name string, port int, protocol string) (StreamInterface, error)
 }
 
 type VirtualMachineInstanceMigrationInterface interface {

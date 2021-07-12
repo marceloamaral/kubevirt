@@ -91,8 +91,8 @@ var _ = SIGDescribe("Control Plane Performance Density Testing", func() {
 
 	// Run all density tests
 	Describe("Density test", func() {
-
-		for _, testArg := range densityTests {
+		for i := range densityTests {
+			testArg := densityTests[i]
 			Context(fmt.Sprintf("%s create a batch of %d VMIs", testArg.GinkoLabel, testArg.VMCount), func() {
 
 				desc := fmt.Sprintf("latency should be within limit of %d seconds when create %d vms",
@@ -145,7 +145,7 @@ func createBatchVMWithRateControl(virtClient kubecli.KubevirtClient, testArg Den
 		_, err := virtClient.VirtualMachineInstance(util.NamespaceTestDefault).Create(vmi)
 		Expect(err).ToNot(HaveOccurred())
 
-		// control the throughput with waiting interval
+		// sleep to manually throttle API requests.
 		time.Sleep(300 * time.Millisecond)
 	}
 }
@@ -233,6 +233,7 @@ func deleteVMIBatch(virtClient kubecli.KubevirtClient, status *e2emetrics.BatchS
 		gracePeriodSeconds := int64(0)
 		err := virtClient.VirtualMachineInstance(data.Namespace).Delete(data.Name, &metav1.DeleteOptions{GracePeriodSeconds: &gracePeriodSeconds})
 		Expect(err).To(BeNil())
+		// sleep to manually throttle API requests
 		time.Sleep(200 * time.Millisecond)
 	}
 	status.RUnlock()

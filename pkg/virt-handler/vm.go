@@ -160,7 +160,7 @@ func NewController(
 	capabilities *nodelabellerapi.Capabilities,
 ) *VirtualMachineController {
 
-	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "virt-handler-vm")
 
 	c := &VirtualMachineController{
 		Queue:                       queue,

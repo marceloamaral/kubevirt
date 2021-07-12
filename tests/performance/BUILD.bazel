@@ -5,7 +5,6 @@ go_library(
     srcs = [
         "density.go",
         "framework.go",
-        "utils.go",
     ],
     importpath = "kubevirt.io/kubevirt/tests/performance",
     visibility = ["//visibility:public"],

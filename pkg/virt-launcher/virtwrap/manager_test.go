@@ -36,7 +36,7 @@ import (
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	libvirt "libvirt.org/libvirt-go"
+	"libvirt.org/go/libvirt"
 
 	v1 "kubevirt.io/client-go/api/v1"
 	cloudinit "kubevirt.io/kubevirt/pkg/cloud-init"
@@ -2035,39 +2035,56 @@ var _ = Describe("migratableDomXML", func() {
 		ctrl = gomock.NewController(GinkgoT())
 		mockDomain = cli.NewMockVirDomain(ctrl)
 	})
-	It("should remove only the kubevirt metadata", func() {
+	It("should remove only the kubevirt migration metadata", func() {
 		domXML := `<domain type="kvm" id="1">
   <name>kubevirt</name>
   <metadata>
     <kubevirt xmlns="http://kubevirt.io">
       <metadata>
-         <kubevirt>nested</kubevirt>
+         <kubevirt>
+            <migration>nested</migration>
+         </kubevirt>
       </metadata>
       <uid>d38cac9c-435b-42d5-960e-06e8d41146e8</uid>
+      <migration>
+         <uid>d38cac9c-435b-42d5-960e-06e8d41146e8</uid>
+         <failed>false</failed>
+      </migration>
       <graceperiod>
         <deletionGracePeriodSeconds>0</deletionGracePeriodSeconds>
       </graceperiod>
     </kubevirt>
     <othermetadata>
       <kubevirt>
-         <keepme>42</keepme>
+         <migration>42</migration>
       </kubevirt>
     </othermetadata>
   </metadata>
-  <kubevirt>this should stay</kubevirt>
+  <kubevirt><migration>this should stay</migration></kubevirt>
 </domain>`
-		// migratableDomXML() removes the kubevirt block but not its ident, which is its own token, hence the blank line below
+		// migratableDomXML() removes the migration block but not its ident, which is its own token, hence the blank line below
 		expectedXML := `<domain type="kvm" id="1">
   <name>kubevirt</name>
   <metadata>
-    
+    <kubevirt xmlns="http://kubevirt.io">
+      <metadata>
+         <kubevirt>
+            <migration>nested</migration>
+         </kubevirt>
+      </metadata>
+      <uid>d38cac9c-435b-42d5-960e-06e8d41146e8</uid>
+      
+      <graceperiod>
+        <deletionGracePeriodSeconds>0</deletionGracePeriodSeconds>
+      </graceperiod>
+    </kubevirt>
     <othermetadata>
       <kubevirt>
-         <keepme>42</keepme>
+         <migration>42</migration>
       </kubevirt>
     </othermetadata>
   </metadata>
-  <kubevirt>this should stay</kubevirt>
+  <kubevirt><migration>this should stay</migration></kubevirt>
 </domain>`
 		mockDomain.EXPECT().Free()
 		vmi := newVMI("testns", "kubevirt")
